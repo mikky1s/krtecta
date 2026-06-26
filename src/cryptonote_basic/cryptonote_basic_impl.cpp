@@ -1,4 +1,4 @@
-// Copyright (c) 2014-2024, The Monero Project
+// Copyright (c) 2014-2022, The Monero Project
 //
 // All rights reserved.
 //
@@ -80,38 +80,43 @@ namespace cryptonote {
     return CRYPTONOTE_MAX_TX_SIZE;
   }
   //-----------------------------------------------------------------------------------------------
-  bool get_block_reward(size_t median_weight, size_t current_block_weight, uint64_t already_generated_coins, uint64_t &reward, uint8_t version) {
-    static_assert(DIFFICULTY_TARGET_V2%60==0&&DIFFICULTY_TARGET_V1%60==0,"difficulty targets must be a multiple of 60");
-    const int target = version < 2 ? DIFFICULTY_TARGET_V1 : DIFFICULTY_TARGET_V2;
-    const int target_minutes = target / 60;
-    const int emission_speed_factor = EMISSION_SPEED_FACTOR_PER_MINUTE - (target_minutes-1);
+bool get_block_reward(size_t median_weight, size_t current_block_weight, uint64_t already_generated_coins, uint64_t &reward, uint8_t version, uint64_t height)
+{
+    // krtecta custom emission: starts at 5000, decreases by 25 per day, floor at 50
+    const uint64_t blocks_per_day = 86400 / DIFFICULTY_TARGET_V2; // 720 for V2
+    const uint64_t days_since_genesis = height / blocks_per_day;
+    const uint64_t initial_reward = 5000 * COIN;
+    const uint64_t decrease_per_day = 25 * COIN;
+    const uint64_t min_reward = 50 * COIN;
 
-    uint64_t base_reward = (MONEY_SUPPLY - already_generated_coins) >> emission_speed_factor;
-    if (base_reward < FINAL_SUBSIDY_PER_MINUTE*target_minutes)
-    {
-      base_reward = FINAL_SUBSIDY_PER_MINUTE*target_minutes;
-    }
+    uint64_t base_reward;
+    if (days_since_genesis * decrease_per_day >= initial_reward - min_reward)
+        base_reward = min_reward;
+    else
+        base_reward = initial_reward - days_since_genesis * decrease_per_day;
 
+    if (base_reward < min_reward)
+        base_reward = min_reward;
+
+    // Далее идёт стандартная логика штрафа за размер блока (её оставляем без изменений)
     uint64_t full_reward_zone = get_min_block_weight(version);
 
-    //make it soft
-    if (median_weight < full_reward_zone) {
-      median_weight = full_reward_zone;
+    if (median_weight < full_reward_zone)
+        median_weight = full_reward_zone;
+
+    if (current_block_weight <= median_weight)
+    {
+        reward = base_reward;
+        return true;
     }
 
-    if (current_block_weight <= median_weight) {
-      reward = base_reward;
-      return true;
-    }
-
-    if(current_block_weight > 2 * median_weight) {
-      MERROR("Block cumulative weight is too big: " << current_block_weight << ", expected less than " << 2 * median_weight);
-      return false;
+    if (current_block_weight > 2 * median_weight)
+    {
+        MERROR("Block cumulative weight is too big: " << current_block_weight << ", expected less than " << 2 * median_weight);
+        return false;
     }
 
     uint64_t product_hi;
-    // BUGFIX: 32-bit saturation bug (e.g. ARM7), the result was being
-    // treated as 32-bit by default.
     uint64_t multiplicand = 2 * median_weight - current_block_weight;
     multiplicand *= current_block_weight;
     uint64_t product_lo = mul128(base_reward, multiplicand, &product_hi);
@@ -125,7 +130,7 @@ namespace cryptonote {
 
     reward = reward_lo;
     return true;
-  }
+}
   //------------------------------------------------------------------------------------
   uint8_t get_account_address_checksum(const public_address_outer_blob& bl)
   {
@@ -172,7 +177,7 @@ namespace cryptonote {
     return tools::base58::encode_addr(integrated_address_prefix, t_serializable_object_to_blob(iadr));
   }
   //-----------------------------------------------------------------------
-  bool is_coinbase(const transaction_prefix& tx)
+  bool is_coinbase(const transaction& tx)
   {
     if(tx.vin.size() != 1)
       return false;
@@ -310,53 +315,6 @@ namespace cryptonote {
   bool operator ==(const cryptonote::block& a, const cryptonote::block& b) {
     return cryptonote::get_block_hash(a) == cryptonote::get_block_hash(b);
   }
-  //--------------------------------------------------------------------------------
-  int compare_hash32_reversed_nbits(const crypto::hash& ha, const crypto::hash& hb, unsigned int nbits)
-  {
-    static_assert(sizeof(uint64_t) * 4 == sizeof(crypto::hash), "hash is wrong size");
-
-    // We have to copy these buffers b/c of the strict aliasing rule
-    uint64_t va[4];
-    memcpy(va, &ha, sizeof(crypto::hash));
-    uint64_t vb[4];
-    memcpy(vb, &hb, sizeof(crypto::hash));
-
-    for (int n = 3; n >= 0 && nbits; --n)
-    {
-      const unsigned int msb_nbits = std::min<unsigned int>(64, nbits);
-      const uint64_t lsb_nbits_dropped = static_cast<uint64_t>(64 - msb_nbits);
-      const uint64_t van = SWAP64LE(va[n]) >> lsb_nbits_dropped;
-      const uint64_t vbn = SWAP64LE(vb[n]) >> lsb_nbits_dropped;
-      nbits -= msb_nbits;
-
-      if (van < vbn) return -1; else if (van > vbn) return 1;
-    }
-
-    return 0;
-  }
-
-  crypto::hash make_hash32_loose_template(unsigned int nbits, const crypto::hash& h)
-  {
-    static_assert(sizeof(uint64_t) * 4 == sizeof(crypto::hash), "hash is wrong size");
-
-    // We have to copy this buffer b/c of the strict aliasing rule
-    uint64_t vh[4];
-    memcpy(vh, &h, sizeof(crypto::hash));
-
-    for (int n = 3; n >= 0; --n)
-    {
-      const unsigned int msb_nbits = std::min<unsigned int>(64, nbits);
-      const uint64_t mask = msb_nbits ? (~((std::uint64_t(1) << (64 - msb_nbits)) - 1)) : 0;
-      nbits -= msb_nbits;
-
-      vh[n] &= SWAP64LE(mask);
-    }
-
-    crypto::hash res;
-    memcpy(&res, vh, sizeof(crypto::hash));
-    return res;
-  }
-  //--------------------------------------------------------------------------------
 }
 
 //--------------------------------------------------------------------------------
