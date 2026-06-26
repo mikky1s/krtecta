@@ -1,4 +1,4 @@
-// Copyright (c) 2014-2024, The Monero Project
+// Copyright (c) 2014-2022, The Monero Project
 // 
 // All rights reserved.
 // 
@@ -28,7 +28,6 @@
 // 
 // Parts of this file are originally copyright (c) 2012-2013 The Cryptonote developers
 
-#include <optional>
 #include <unordered_set>
 #include <random>
 #include "include_base_utils.h"
@@ -44,9 +43,7 @@ using namespace epee;
 #include "cryptonote_basic/tx_extra.h"
 #include "crypto/crypto.h"
 #include "crypto/hash.h"
-#include "crypto/wire.h"
 #include "ringct/rctSigs.h"
-#include "serialization/wire.h"
 
 using namespace crypto;
 
@@ -61,7 +58,7 @@ namespace
  * @param keys account keys of sender
  * @return subaddress index of `change_addr` if in the subaddress map and re-derives from device, otherwise nullopt
  */
-std::optional<cryptonote::subaddress_index> sanity_check_change_address(
+boost::optional<cryptonote::subaddress_index> sanity_check_change_address(
   const cryptonote::account_public_address& change_addr,
   const std::unordered_map<crypto::public_key, cryptonote::subaddress_index>& subaddresses,
   const cryptonote::account_keys &keys
@@ -77,9 +74,9 @@ std::optional<cryptonote::subaddress_index> sanity_check_change_address(
   hw::device &hwdev = keys.get_device();
   const auto recomputed_addr = hwdev.get_subaddress(keys, subaddr_index);
   if (change_addr != recomputed_addr)
-    return std::nullopt;
+    return boost::none;
 
-  return {subaddr_index};
+  return boost::optional<cryptonote::subaddress_index>(subaddr_index);
 }
 //---------------------------------------------------------------
 } //anonymous namespace
@@ -130,7 +127,7 @@ namespace cryptonote
     in.height = height;
 
     uint64_t block_reward;
-    if(!get_block_reward(median_weight, current_block_weight, already_generated_coins, block_reward, hard_fork_version))
+    if(!get_block_reward(median_weight, current_block_weight, already_generated_coins, block_reward, hard_fork_version, height))
     {
       LOG_PRINT_L0("Block is too big");
       return false;
@@ -219,16 +216,6 @@ namespace cryptonote
     return true;
   }
   //---------------------------------------------------------------
-  namespace
-  {
-    template<typename F, typename T>
-    void map_backlog_entry(F& format, T& self)
-    {
-      wire::object(format, WIRE_FIELD(id), WIRE_FIELD(weight), WIRE_FIELD(fee));
-    }
-  }
-  WIRE_DEFINE_OBJECT(tx_block_template_backlog_entry, map_backlog_entry);
-  //---------------------------------------------------------------
   crypto::public_key get_destination_view_key_pub(const std::vector<tx_destination_entry> &destinations, const boost::optional<cryptonote::account_public_address>& change_addr)
   {
     account_public_address addr = {null_pkey, null_pkey};
@@ -261,7 +248,7 @@ namespace cryptonote
       return false;
     }
 
-    std::optional<cryptonote::subaddress_index> recognized_change_index;
+    boost::optional<cryptonote::subaddress_index> recognized_change_index;
     if (change_addr)
       recognized_change_index = sanity_check_change_address(*change_addr, subaddresses, sender_account_keys);
 
@@ -466,12 +453,11 @@ namespace cryptonote
       crypto::public_key out_eph_public_key;
       crypto::view_tag view_tag;
 
-      const bool r = hwdev.generate_output_ephemeral_keys(tx.version,sender_account_keys, txkey_pub, tx_key,
+      hwdev.generate_output_ephemeral_keys(tx.version,sender_account_keys, txkey_pub, tx_key,
                                            dst_entr, change_addr, output_index,
                                            need_additional_txkeys, additional_tx_keys,
                                            additional_tx_public_keys, amount_keys, out_eph_public_key,
                                            use_view_tags, view_tag);
-      CHECK_AND_ASSERT_MES(r, false, "Failed to generate output ephemeral keys");
 
       tx_out out;
       cryptonote::set_tx_out(dst_entr.amount, out_eph_public_key, use_view_tags, view_tag, out);
@@ -668,10 +654,7 @@ namespace cryptonote
   {
     hw::device &hwdev = sender_account_keys.get_device();
     hwdev.open_tx(tx_key);
-    const auto auto_close_tx = epee::misc_utils::create_scope_leave_handler([&hwdev](){
-      hwdev.close_tx();
-    });
-    {
+    try {
       // figure out if we need to make additional tx pubkeys
       size_t num_stdaddresses = 0;
       size_t num_subaddresses = 0;
@@ -689,7 +672,11 @@ namespace cryptonote
 
       bool shuffle_outs = true;
       bool r = construct_tx_with_tx_key(sender_account_keys, subaddresses, sources, destinations, change_addr, extra, tx, tx_key, additional_tx_keys, rct, rct_config, shuffle_outs, use_view_tags);
+      hwdev.close_tx();
       return r;
+    } catch(...) {
+      hwdev.close_tx();
+      throw;
     }
   }
   //---------------------------------------------------------------
@@ -736,13 +723,29 @@ namespace cryptonote
 
   bool get_block_longhash(const Blockchain *pbc, const blobdata& bd, crypto::hash& res, const uint64_t height, const int major_version, const crypto::hash *seed_hash, const int miners)
   {
-    crypto::hash seed_hash_ = crypto::null_hash;
-    if (pbc != NULL && major_version >= RX_BLOCK_VERSION)
+    // block 202612 bug workaround
+    if (height == 202612)
     {
-      const uint64_t seed_height = rx_seedheight(height);
-      seed_hash_ = seed_hash ? *seed_hash : pbc->get_pending_block_id_by_height(seed_height);
+      static const std::string longhash_202612 = "84f64766475d51837ac9efbef1926486e58563c95a19fef4aec3254f03000000";
+      epee::string_tools::hex_to_pod(longhash_202612, res);
+      return true;
     }
-    res = get_block_longhash(bd, height, major_version, seed_hash_);
+    if (major_version >= RX_BLOCK_VERSION)
+    {
+      crypto::hash hash;
+      if (pbc != NULL)
+      {
+        const uint64_t seed_height = rx_seedheight(height);
+        hash = seed_hash ? *seed_hash : pbc->get_pending_block_id_by_height(seed_height);
+      } else
+      {
+        memset(&hash, 0, sizeof(hash));  // only happens when generating genesis block
+      }
+      rx_slow_hash(hash.data, bd.data(), bd.size(), res.data);
+    } else {
+      const int pow_variant = major_version >= 7 ? major_version - 6 : 0;
+      crypto::cn_slow_hash(bd.data(), bd.size(), res, pow_variant, height);
+    }
     return true;
   }
 
